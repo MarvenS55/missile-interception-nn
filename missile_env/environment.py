@@ -1,108 +1,103 @@
-# Updated environment.py with better initialization and interceptor ground impact check
+# missile_env/environment.py
 import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
 from .dynamics import PointMass
 
-class MissileEnv:
-    """
-    Manages the simulation state, now including gravity and drag calculations.
-    """
-    def __init__(self):
-        # --- Physical constants ---
-        self.G = 9.81  # Acceleration due to gravity (m/s^2)
-        self.RHO = 1.225  # Air density at sea level (kg/m^3)
-        self.C_D = 0.5  # Drag coefficient (simplified)
-        self.AREA = 0.0314 # Cross-sectional area of missile (m^2)
+class MissileEnv(gym.Env):
+    metadata = {'render_modes': []}
 
+    def __init__(self):
+        super().__init__()
+        self.G = 9.81
+        self.RHO = 1.225
+        self.C_D = 0.5
+        self.AREA = 0.0314
+        self.time_step = 0.01
+        self.max_steps = 10000
+        self.current_step = 0
+        self.max_thrust = 3000000.0
+
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(6,), dtype=np.float32)
+        
         self.interceptor = None
         self.target = None
-        self.time_step = 0.05  # Using a smaller time step for more stability
-        self.reset()
+        self.prev_distance = None
 
-    def reset(self, target_pos=None, target_vel=None):
-        """Resets the simulation with new mass properties and optional randomization."""
-        if target_pos is None:
-            # Ensure target is always hight above interceptor so it simulates it as approaching like real life 
-            target_pos = [
-                np.random.uniform(15000, 35000),  # Further horizontally
-                np.random.uniform(5000, 25000),   # Wider yrange
-                np.random.uniform(20000, 40000)   #  higher altitude
-            ]
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.current_step = 0
         
-        if target_vel is None:
-            # Ensure target has reasonable velocity (not diving too fast)
-            target_vel = [
-                np.random.uniform(-600, -300),    # Moderate xvelocity
-                np.random.uniform(-150, 150),     #  Reasoonable yvelocity  
-                np.random.uniform(-100, 50)       # Limitted descent rate
-            ]
+        target_pos = [self.np_random.uniform(15000, 35000), self.np_random.uniform(5000, 25000), self.np_random.uniform(20000, 40000)]
+        target_vel = [self.np_random.uniform(-600, -300), self.np_random.uniform(-150, 150), self.np_random.uniform(-100, 50)]
         
-        # Target: Heavier, non-powered like irl
-        self.target = PointMass(
-            mass=500.0,  # in kg
-            position=target_pos,
-            velocity=target_vel,
-            name="Target"
-        )
+        self.target = PointMass(mass=500.0, position=target_pos, velocity=target_vel, name="Target")
         
-        # Interceptor: Lighter, powered - starts with higher initial velocity
-        self.interceptor = PointMass(
-            mass=200.0,  # in kg
-            position=[0.0, 0.0, 100.0],  # Start slightly above ground
-            velocity=[0.0, 0.0, 500.0],  # higher initial velocity
-            name="Interceptor"
-        )
+        inter_pos_x = self.np_random.uniform(-1000, 1000)
+        inter_pos_y = self.np_random.uniform(-1000, 1000)
+        inter_pos_z = 100.0 + self.np_random.uniform(-50, 50)
+        inter_vel_z = self.np_random.uniform(400, 600)
+        self.interceptor = PointMass(mass=200.0, position=[inter_pos_x, inter_pos_y, inter_pos_z], velocity=[0.0, 0.0, inter_vel_z], name="Interceptor")
         
-        return self.get_state()
+        observation = self._get_obs()
+        info = self._get_info()
+        
+        self.prev_distance = np.linalg.norm(self.target.position - self.interceptor.position)
+        
+        return observation, info
 
-    def get_state(self):
-        """Returns the current state (relative position and velocity)."""
-        relative_position = self.target.position - self.interceptor.position
-        relative_velocity = self.target.velocity - self.interceptor.velocity
-        return np.concatenate([relative_position, relative_velocity])
-
-    def _calculate_forces(self, obj):
-        """Helper function to calculate gravity and drag for a PointMass object."""
-        # Gravity force (acts downwards on Z axis)
-        gravity_force = np.array([0.0, 0.0, -self.G * obj.mass])
-
-        # Drag force (opposes velocity vector)
-        speed = np.linalg.norm(obj.velocity)
-        if speed > 0:
-            drag_magnitude = 0.5 * self.RHO * speed**2 * self.C_D * self.AREA
-            drag_force = -drag_magnitude * (obj.velocity / speed)
-        else:
-            drag_force = np.array([0.0, 0.0, 0.0])
-
-        return gravity_force, drag_force
-
-    def step(self, interceptor_thrust):
-        """Advances the simulation by one time step."""
-        # Calculate forces for the interceptor
+    def step(self, action):
+        interceptor_thrust = action * self.max_thrust
+        
         interceptor_gravity, interceptor_drag = self._calculate_forces(self.interceptor)
         self.interceptor.update(interceptor_thrust, interceptor_gravity, interceptor_drag, self.time_step)
 
-        # Calculate forces for the target (no thrust)
         target_gravity, target_drag = self._calculate_forces(self.target)
-        self.target.update(np.array([0,0,0]), target_gravity, target_drag, self.time_step)
+        self.target.update(np.zeros(3), target_gravity, target_drag, self.time_step)
 
-        new_state = self.get_state()
+        self.current_step += 1
         
-        distance = np.linalg.norm(self.target.position - self.interceptor.position)
-        done = False
-        info = {'status': 'In-flight', 'distance': distance}
+        observation = self._get_obs()
+        info = self._get_info()
+        distance = info['distance']
 
+        # --- REWARD: Based on distance reduction (other systems created a very lazy intercepter that just flopped)---
+        delta_dist = distance - self.prev_distance  # negative iff distance reduced
+        reward = -delta_dist - 0.1  # Positive if distance reduced, minus time penalty
+        self.prev_distance = distance
+
+        terminated = False
         if distance < 20.0:
-            done = True
+            terminated = True
+            reward += 1000
             info['status'] = 'Intercept'
+        elif self.target.position[2] <= 0 or self.interceptor.position[2] <= 0:
+            terminated = True
+            reward -= 1000
+            info['status'] = 'FAILED: Interceptor Impact' if self.interceptor.position[2] <= 0 else 'FAILED: Target Impact'
         
-        # Failure condition: target hits the ground
-        if self.target.position[2] <= 0:
-            done = True
-            info['status'] = 'FAILED: Target Impact'
-            
-        # New failure condition: interceptor hits the ground
-        if self.interceptor.position[2] <= 0:
-            done = True
-            info['status'] = 'FAILED: Interceptor Impact'
+        truncated = self.current_step >= self.max_steps
+        if truncated and not terminated:
+            info['status'] = 'FAILED: TIMEOUT'
+            reward -= 1000
 
-        return new_state, done, info
+        return observation, reward, terminated, truncated, info
+
+    def _get_obs(self):
+        relative_position = self.target.position - self.interceptor.position
+        relative_velocity = self.target.velocity - self.interceptor.velocity
+        return np.concatenate([relative_position, relative_velocity]).astype(np.float32)
+
+    def _get_info(self):
+        distance = np.linalg.norm(self.target.position - self.interceptor.position)
+        return {'distance': distance, 'status': 'In-flight'}
+
+    def _calculate_forces(self, obj):
+        gravity_force = np.array([0.0, 0.0, -self.G * obj.mass])
+        speed = np.linalg.norm(obj.velocity)
+        drag_force = np.zeros(3)
+        if speed > 0:
+            drag_magnitude = 0.5 * self.RHO * speed**2 * self.C_D * self.AREA
+            drag_force = -drag_magnitude * (obj.velocity / speed)
+        return gravity_force, drag_force
